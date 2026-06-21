@@ -1,0 +1,12 @@
+{
+  "episodes_loaded": 11,
+  "diffs_loaded": 6,
+  "sft_total": 244,
+  "train": 198,
+  "val": 20,
+  "test": 26,
+  "toolcall_total": 244,
+  "preference_pairs": 244,
+  "out_dir": "/home/cnic/xiaocheng/projects/aiops-stratus/stratus/planner/data",
+  "note": "Synthetic samples are parameterized from verified targetPort template; do not report them as additional real episodes."
+}

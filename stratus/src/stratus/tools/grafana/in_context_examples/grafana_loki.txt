@@ -1,0 +1,23 @@
+#THIS NEEDS TO BE UPDATED TO THE FULL FUNCTION CALL INSTEAD OF JUST THE LOGQL QUERY
+
+EXAMPLE INPUTS AND OUTPUTS
+
+INPUT: get the logs from <value> <app>
+OUTPUT: {<label>=<value>}
+
+INPUT: get the logs from the payment service with label app=payment
+OUTPUT: {app="payment"}
+
+INPUT: get the logs from the payment deployment in the default namespace
+OUTPUT: {container=~"payment-*"}
+
+INPUT: get the logs from the worker-node-1 kubernetes host
+OUTPUT: {node_name="worker-node-1"}
+
+INPUT: get the kubernetes events for a deployment with the label app=back in the default namespace
+OUTPUT: {source="kubernetes-event-exporter"} |= `"app":"back"` |= `"namespace":"default"`
+
+INPUT: get all events from deployment back in namespace simple-us
+OUTPUT: {source="kubernetes-event-exporter"} |= `"namespace":"simple-us"` |= `"kind":"Deployment"` |= `"name":"back"`
+
+END OF EXAMPLES

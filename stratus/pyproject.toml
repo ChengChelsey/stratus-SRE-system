@@ -1,0 +1,61 @@
+[project]
+name = "stratus"
+version = "0.1.0"
+description = "Stratus using crewAI"
+authors = [
+    { name = "Your Name", email = "you@example.com" },
+]
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "langchain-ibm>=0.3.0",
+    "langchain-core>=0.3.0,<0.4",
+    "python-dotenv>=1.0",
+    "networkx>=3.3",
+    "panel>=1.5.2",
+    "streamlit>=1.39.0",
+    "promformat>=1.0.2",
+    "litellm==1.65.0",
+    "antlr4-python3-runtime==4.10",
+    "numpy==1.26.4",
+    "crewai-tools>=0.25.8",
+    "crewai==0.95.0",
+    "importlib==1.0.4",
+    "black==24.4.2",
+    "pyright==1.1.366",
+    "openai>=1.33.0",
+    "pydantic==2.7.4",
+    "kubernetes==30.1.0",
+    "colorama==0.4.6",
+    "rich==13.7.1",
+    "tiktoken==0.7.0",
+    "prompt-toolkit==3.0.47",
+    "prometheus-api-client==0.5.5",
+    "autogen-agentchat==0.2.40",
+    "elasticsearch==8.16.0",
+    "azure-identity==1.19.0",
+    "azure-ai-ml==1.22.1",
+    "paramiko==3.5.0",
+    "wandb>=0.19.10",
+    "bashlex>=0.18",
+]
+
+[project.scripts]
+stratus = "stratus.main:run"
+run_crew = "stratus.main:run"
+train = "stratus.main:train"
+replay = "stratus.main:replay"
+test = "stratus.main:test"
+
+[build-system]
+requires = [
+    "hatchling",
+]
+build-backend = "hatchling.build"
+
+[tool.black]
+target-version = ['py312']
+line-length = 120
+
+[tool.isort]
+profile = "black"
+line_length = 120

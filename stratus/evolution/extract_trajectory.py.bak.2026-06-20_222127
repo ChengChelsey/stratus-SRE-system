@@ -1,0 +1,102 @@
+import json
+import re
+from pathlib import Path
+
+
+def is_noise(line):
+    noise_keywords = [
+        "LiteLLM",
+        "HTTP Request",
+        "cost_calculator",
+        "Retrying",
+        "DEBUG",
+        "INFO - cost",
+        "pydantic",
+    ]
+    return any(k in line for k in noise_keywords)
+
+
+def classify(line):
+    if "NL prompt received" in line:
+        return "agent_prompt"
+    if "Executing command" in line:
+        return "action"
+    if "command returned" in line:
+        return "observation"
+    if "DryRunStatus" in line:
+        return "tool_result"
+    if "VALIDATION SUCCESSFUL" in line:
+        return "oracle"
+    return None
+
+
+def parse_log(text):
+    steps = []
+    current = None
+
+    for line in text.split("\n"):
+
+        if is_noise(line):
+            continue
+
+        t = classify(line)
+
+        if not t:
+            continue
+
+        # 新 step start
+        if t == "agent_prompt":
+            current = {
+                "agent_prompt": line,
+                "action": None,
+                "observation": None,
+                "oracle_hint": False
+            }
+            steps.append(current)
+
+        elif t == "action" and current:
+            current["action"] = line
+
+        elif t == "observation" and current:
+            current["observation"] = line
+
+        elif t == "oracle":
+            if current:
+                current["oracle_hint"] = True
+
+    return steps
+
+
+def main():
+    root = Path("eval")
+    out = Path("evolution/trajectory.jsonl")
+
+    episodes = 0
+
+    with open(out, "w") as f:
+
+        for d in root.glob("*k8s_target_port*"):
+            log = d / "run.log"
+            if not log.exists():
+                continue
+
+            text = log.read_text(errors="ignore")
+
+            steps = parse_log(text)
+
+            if len(steps) == 0:
+                continue
+
+            episodes += 1
+
+            f.write(json.dumps({
+                "episode_id": d.name,
+                "steps": steps,
+                "success": "VALIDATION SUCCESSFUL" in text
+            }) + "\n")
+
+    print("saved:", out, "episodes:", episodes)
+
+
+if __name__ == "__main__":
+    main()

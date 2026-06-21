@@ -1,0 +1,10 @@
+{
+  "sources": 11,
+  "episodes": 11,
+  "steps": 101,
+  "resource_diffs": 6,
+  "successes": 4,
+  "targetport_verified": 6,
+  "dangerous_operations": 2,
+  "out_dir": "/home/cnic/xiaocheng/projects/aiops-stratus/stratus/evolution/trajectories"
+}

@@ -1,0 +1,47 @@
+sre_diagnosis_tool_task:
+  description: 
+    Diagnose the problem from the alert. Don't stop until you find all root causes of the issue. Use the tools provided to gather information to help you with diagnosis.
+    Diagnosis needs to go as deep as possible. Make sure you check every entity that could possibly be related to the issue before coming to a final answer.
+    The you have some reflection from the previous run '''{previous_run}'''
+  expected_output: 
+    Fault propagation chains indicating the independent paths along which the faults propagated and led to the alerts. Specify the root cause entity in each propagation chain.
+  agent: sre_diagnosis_agent
+
+diagnosis_json_generation_task:
+  description: >
+    Generate a JSON-structured diagnosis report.
+  expected_output: >
+    A JSON-structured diagnosis report.
+  agent: sre_diagnosis_agent
+    
+sre_mitigation_task:
+  description: 
+    Create remediation plans with concrete steps based on the incident diagnosis report. Then, use the tools provided to execute this plan.
+    The you have some reflection from the previous run '''{previous_run}'''
+  expected_output: 
+    A list of remediation plans, each with a list of remediation steps.
+  agent: sre_mitigation_agent
+
+mitigation_json_generation_task:
+  description: >
+    Generate a JSON-structured mitigation report.
+  expected_output: >
+    A JSON-structured mitigation report listing all steps taken to mitigate the IT incident.
+  agent: sre_mitigation_agent
+
+sre_rollback_task:
+  description: >
+    You are given a system and a rollback tool. The system is either in a initial faulty state, or in the state you left it incompletely repaired after the previous round of mitigation. You need to rollback the system to the initial state since the operations you performed in the previous round may negatively impact your current round of mitigation.
+
+    You should run the rollback tool as many times as you can, since this rollback tool undos the last operation performed on the system. You should run the rollback tool until it returns that there are no more operations to undo.
+  expected_output: >
+    Submit the task.
+  agent: sre_rollback_agent
+
+initial_analysis_task:
+  description: >
+    Analyze the traces or metrics to localize which part of the system, e.g., a service, a component, a pod, a node, etc., has anomalies. Always use GetFilteredTracesTool first to get filtered traces to help with localization. Note that it may not be helpful to use the tools too many times.
+  expected_output: >
+    The first part is a list of entities that have anomalies. Also, annotate the possible root cause entity of the anomalies and denote that the following analysis can start from that/those root cause entity(ies). If you cannot find the root cause entity, just output an empty list.
+    The second part is the fault propagation chains indicating the independent paths along which the faults propagated and led to the alerts. Specify the root cause entity in each propagation chain.
+  agent: sre_diagnosis_agent

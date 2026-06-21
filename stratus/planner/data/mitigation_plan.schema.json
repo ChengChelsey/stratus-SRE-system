@@ -1,0 +1,356 @@
+{
+  "$defs": {
+    "ActionPlan": {
+      "additionalProperties": false,
+      "properties": {
+        "tool": {
+          "default": "k8s_change",
+          "title": "Tool",
+          "type": "string"
+        },
+        "operation": {
+          "$ref": "#/$defs/OperationType"
+        },
+        "resource": {
+          "$ref": "#/$defs/ResourceRef"
+        },
+        "patch": {
+          "items": {
+            "$ref": "#/$defs/JsonPatchOp"
+          },
+          "title": "Patch",
+          "type": "array"
+        },
+        "risk": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/RiskLevel"
+            }
+          ],
+          "default": "medium"
+        },
+        "reason": {
+          "default": "",
+          "title": "Reason",
+          "type": "string"
+        },
+        "preconditions": {
+          "items": {
+            "$ref": "#/$defs/Condition"
+          },
+          "title": "Preconditions",
+          "type": "array"
+        },
+        "postconditions": {
+          "items": {
+            "$ref": "#/$defs/Condition"
+          },
+          "title": "Postconditions",
+          "type": "array"
+        },
+        "rollback": {
+          "default": "resource_snapshot",
+          "enum": [
+            "resource_snapshot",
+            "command",
+            "none"
+          ],
+          "title": "Rollback",
+          "type": "string"
+        }
+      },
+      "required": [
+        "operation",
+        "resource"
+      ],
+      "title": "ActionPlan",
+      "type": "object"
+    },
+    "Condition": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "resource": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ResourceRef"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "path": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Path"
+        },
+        "operator": {
+          "default": "exists",
+          "enum": [
+            "eq",
+            "ne",
+            "exists",
+            "non_empty",
+            "ready",
+            "oracle_pass"
+          ],
+          "title": "Operator",
+          "type": "string"
+        },
+        "expected": {
+          "anyOf": [
+            {},
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Expected"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "title": "Condition",
+      "type": "object"
+    },
+    "EvidenceItem": {
+      "additionalProperties": false,
+      "properties": {
+        "source": {
+          "default": "agent",
+          "enum": [
+            "trace",
+            "log",
+            "kubernetes",
+            "oracle",
+            "agent",
+            "manual"
+          ],
+          "title": "Source",
+          "type": "string"
+        },
+        "description": {
+          "title": "Description",
+          "type": "string"
+        },
+        "resource": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ResourceRef"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "key": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Key"
+        },
+        "value": {
+          "anyOf": [
+            {},
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Value"
+        }
+      },
+      "required": [
+        "description"
+      ],
+      "title": "EvidenceItem",
+      "type": "object"
+    },
+    "JsonPatchOp": {
+      "additionalProperties": false,
+      "properties": {
+        "op": {
+          "enum": [
+            "test",
+            "replace",
+            "add",
+            "remove"
+          ],
+          "title": "Op",
+          "type": "string"
+        },
+        "path": {
+          "title": "Path",
+          "type": "string"
+        },
+        "value": {
+          "anyOf": [
+            {},
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Value"
+        }
+      },
+      "required": [
+        "op",
+        "path"
+      ],
+      "title": "JsonPatchOp",
+      "type": "object"
+    },
+    "OperationType": {
+      "enum": [
+        "read",
+        "get_logs",
+        "get_traces",
+        "read_traces",
+        "json_patch",
+        "merge_patch",
+        "scale",
+        "rollout_restart",
+        "apply_yaml",
+        "create",
+        "delete",
+        "submit",
+        "rollback",
+        "unknown"
+      ],
+      "title": "OperationType",
+      "type": "string"
+    },
+    "ResourceKind": {
+      "enum": [
+        "Service",
+        "Deployment",
+        "Pod",
+        "ConfigMap",
+        "Secret",
+        "StatefulSet",
+        "DaemonSet",
+        "Job",
+        "PersistentVolumeClaim",
+        "PersistentVolume",
+        "Namespace",
+        "Node",
+        "Unknown"
+      ],
+      "title": "ResourceKind",
+      "type": "string"
+    },
+    "ResourceRef": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/ResourceKind"
+            }
+          ],
+          "default": "Unknown"
+        },
+        "namespace": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Namespace"
+        },
+        "name": {
+          "title": "Name",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "title": "ResourceRef",
+      "type": "object"
+    },
+    "RiskLevel": {
+      "enum": [
+        "low",
+        "medium",
+        "high",
+        "blocked"
+      ],
+      "title": "RiskLevel",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "default": "1.0",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "task_id": {
+      "title": "Task Id",
+      "type": "string"
+    },
+    "fault_type": {
+      "title": "Fault Type",
+      "type": "string"
+    },
+    "root_cause": {
+      "$ref": "#/$defs/ResourceRef"
+    },
+    "evidence": {
+      "items": {
+        "$ref": "#/$defs/EvidenceItem"
+      },
+      "title": "Evidence",
+      "type": "array"
+    },
+    "actions": {
+      "items": {
+        "$ref": "#/$defs/ActionPlan"
+      },
+      "title": "Actions",
+      "type": "array"
+    },
+    "confidence": {
+      "default": 0.5,
+      "maximum": 1.0,
+      "minimum": 0.0,
+      "title": "Confidence",
+      "type": "number"
+    }
+  },
+  "required": [
+    "task_id",
+    "fault_type",
+    "root_cause",
+    "actions"
+  ],
+  "title": "MitigationPlan",
+  "type": "object"
+}

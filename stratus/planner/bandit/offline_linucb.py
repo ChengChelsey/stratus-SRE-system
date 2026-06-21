@@ -1,0 +1,548 @@
+from __future__ import annotations
+
+import argparse
+import copy
+import json
+import math
+import random
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+
+from planner.schema import MitigationPlan
+
+
+FEATURE_NAMES = [
+    "bias",
+    "diagnosis_alignment",
+    "op_json_patch",
+    "op_rollout_restart",
+    "op_merge_patch",
+    "op_delete",
+    "op_create_or_apply",
+    "resource_is_service",
+    "resource_name_match",
+    "namespace_match",
+    "has_targetport_replace",
+    "targetport_replace_value_match",
+    "has_targetport_test",
+    "targetport_test_value_match",
+    "patch_field_count_norm",
+    "action_count_norm",
+    "rollback_snapshot",
+    "risk_low",
+    "risk_medium",
+    "risk_high_or_blocked",
+    "preconditions_norm",
+    "postconditions_norm",
+]
+
+
+def read_jsonl(path: Path) -> list[dict[str, Any]]:
+    rows = []
+    with path.open() as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                rows.append(json.loads(line))
+    return rows
+
+
+def write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w") as f:
+        for row in rows:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def enum_value(x: Any) -> str:
+    return getattr(x, "value", str(x))
+
+
+def safe_int(x: Any, default: int = -999999) -> int:
+    try:
+        return int(x)
+    except Exception:
+        return default
+
+
+def parse_prompt(prompt: str) -> dict[str, Any]:
+    try:
+        obj = json.loads(prompt)
+    except Exception:
+        return {}
+
+    service = obj.get("kubernetes_evidence", {}).get("service", {}) or {}
+    backend = obj.get("kubernetes_evidence", {}).get("backend_pod", {}) or {}
+
+    return {
+        "namespace": obj.get("namespace"),
+        "service_name": service.get("name") or backend.get("service"),
+        "bad_target_port": safe_int(service.get("targetPort")),
+        "good_target_port": safe_int(backend.get("containerPort", service.get("port"))),
+    }
+
+
+def first_action(plan: MitigationPlan):
+    if not plan.actions:
+        return None
+    return plan.actions[0]
+
+
+def targetport_patch_stats(plan: MitigationPlan, prompt_info: dict[str, Any]) -> dict[str, float]:
+    action = first_action(plan)
+    if action is None:
+        return {
+            "has_replace": 0.0,
+            "replace_match": 0.0,
+            "has_test": 0.0,
+            "test_match": 0.0,
+            "patch_fields": 0.0,
+        }
+
+    good = prompt_info.get("good_target_port")
+    bad = prompt_info.get("bad_target_port")
+
+    has_replace = 0.0
+    replace_match = 0.0
+    has_test = 0.0
+    test_match = 0.0
+    fields = set()
+
+    for op in action.patch:
+        path = op.path
+        if op.op != "test":
+            fields.add(path)
+
+        if path.endswith("/targetPort") and op.op == "replace":
+            has_replace = 1.0
+            if safe_int(op.value) == good:
+                replace_match = 1.0
+
+        if path.endswith("/targetPort") and op.op == "test":
+            has_test = 1.0
+            if safe_int(op.value) == bad:
+                test_match = 1.0
+
+    return {
+        "has_replace": has_replace,
+        "replace_match": replace_match,
+        "has_test": has_test,
+        "test_match": test_match,
+        "patch_fields": float(len(fields)),
+    }
+
+
+def feature_vector(plan: MitigationPlan, prompt: str) -> np.ndarray:
+    info = parse_prompt(prompt)
+    action = first_action(plan)
+
+    if action is None:
+        return np.zeros(len(FEATURE_NAMES), dtype=np.float64)
+
+    op = enum_value(action.operation)
+    risk = enum_value(action.risk)
+    resource = action.resource
+
+    resource_kind = enum_value(resource.kind)
+    resource_name = resource.name
+    namespace = resource.namespace
+
+    resource_is_service = 1.0 if resource_kind == "Service" else 0.0
+    resource_name_match = 1.0 if resource_name == info.get("service_name") else 0.0
+    namespace_match = 1.0 if namespace == info.get("namespace") else 0.0
+
+    patch_stats = targetport_patch_stats(plan, info)
+
+    op_json_patch = 1.0 if op == "json_patch" else 0.0
+    op_rollout_restart = 1.0 if op == "rollout_restart" else 0.0
+    op_merge_patch = 1.0 if op == "merge_patch" else 0.0
+    op_delete = 1.0 if op == "delete" else 0.0
+    op_create_or_apply = 1.0 if op in {"create", "apply_yaml"} else 0.0
+
+    rollback_snapshot = 1.0 if action.rollback == "resource_snapshot" else 0.0
+
+    risk_low = 1.0 if risk == "low" else 0.0
+    risk_medium = 1.0 if risk == "medium" else 0.0
+    risk_high = 1.0 if risk in {"high", "blocked"} else 0.0
+
+    diagnosis_alignment = np.mean(
+        [
+            1.0 if plan.fault_type == "service_target_port_mismatch" else 0.0,
+            op_json_patch,
+            resource_is_service,
+            resource_name_match,
+            namespace_match,
+            patch_stats["has_replace"],
+            patch_stats["replace_match"],
+        ]
+    )
+
+    patch_field_count_norm = min(patch_stats["patch_fields"], 5.0) / 5.0
+    action_count_norm = min(len(plan.actions), 5) / 5.0
+    preconditions_norm = min(len(action.preconditions), 5) / 5.0
+    postconditions_norm = min(len(action.postconditions), 5) / 5.0
+
+    values = [
+        1.0,
+        diagnosis_alignment,
+        op_json_patch,
+        op_rollout_restart,
+        op_merge_patch,
+        op_delete,
+        op_create_or_apply,
+        resource_is_service,
+        resource_name_match,
+        namespace_match,
+        patch_stats["has_replace"],
+        patch_stats["replace_match"],
+        patch_stats["has_test"],
+        patch_stats["test_match"],
+        patch_field_count_norm,
+        action_count_norm,
+        rollback_snapshot,
+        risk_low,
+        risk_medium,
+        risk_high,
+        preconditions_norm,
+        postconditions_norm,
+    ]
+
+    return np.asarray(values, dtype=np.float64)
+
+
+def policy_allow(plan: MitigationPlan) -> tuple[bool, str]:
+    for action in plan.actions:
+        op = enum_value(action.operation)
+        risk = enum_value(action.risk)
+
+        if op in {"delete", "create", "apply_yaml"}:
+            return False, f"blocked operation={op}"
+
+        if risk in {"high", "blocked"}:
+            return False, f"blocked risk={risk}"
+
+    return True, "allow"
+
+
+def make_wrong_patch_value(plan: MitigationPlan, prompt: str) -> MitigationPlan:
+    data = copy.deepcopy(plan.model_dump(mode="json"))
+    info = parse_prompt(prompt)
+    bad = info.get("bad_target_port")
+    good = info.get("good_target_port")
+    wrong = bad if bad != good else good + 1
+
+    for op in data["actions"][0].get("patch", []):
+        if op.get("op") == "replace" and str(op.get("path", "")).endswith("/targetPort"):
+            op["value"] = wrong
+
+    data["actions"][0]["reason"] = "Decoy: patch targetPort to the wrong value."
+    data["actions"][0]["risk"] = "low"
+    data["confidence"] = 0.35
+    return MitigationPlan.model_validate(data)
+
+
+def make_missing_test(plan: MitigationPlan) -> MitigationPlan:
+    data = copy.deepcopy(plan.model_dump(mode="json"))
+    data["actions"][0]["patch"] = [
+        op for op in data["actions"][0].get("patch", []) if op.get("op") != "test"
+    ]
+    data["actions"][0]["preconditions"] = []
+    data["actions"][0]["reason"] = "Decoy: correct replace patch but missing test precondition."
+    data["actions"][0]["risk"] = "low"
+    data["confidence"] = 0.65
+    return MitigationPlan.model_validate(data)
+
+
+def make_rollout_restart(plan: MitigationPlan) -> MitigationPlan:
+    data = copy.deepcopy(plan.model_dump(mode="json"))
+    root = data["root_cause"]
+    ns = root.get("namespace")
+    name = root.get("name")
+
+    data["actions"] = [
+        {
+            "tool": "k8s_change",
+            "operation": "rollout_restart",
+            "resource": {
+                "kind": "Deployment",
+                "namespace": ns,
+                "name": name,
+            },
+            "patch": [],
+            "risk": "medium",
+            "reason": "Decoy: restart workload instead of fixing the Service targetPort mismatch.",
+            "preconditions": [
+                {
+                    "name": "deployment_exists",
+                    "resource": {
+                        "kind": "Deployment",
+                        "namespace": ns,
+                        "name": name,
+                    },
+                    "operator": "exists",
+                }
+            ],
+            "postconditions": [
+                {
+                    "name": "workload_oracle_passes",
+                    "operator": "oracle_pass",
+                }
+            ],
+            "rollback": "command",
+        }
+    ]
+    data["confidence"] = 0.4
+    return MitigationPlan.model_validate(data)
+
+
+def make_merge_patch_decoy(plan: MitigationPlan) -> MitigationPlan:
+    data = copy.deepcopy(plan.model_dump(mode="json"))
+    data["actions"][0]["operation"] = "merge_patch"
+    data["actions"][0]["patch"] = []
+    data["actions"][0]["risk"] = "medium"
+    data["actions"][0]["reason"] = "Decoy: ambiguous merge patch may fail list merge-key validation."
+    data["actions"][0]["preconditions"] = [
+        {
+            "name": "resource_exists",
+            "resource": data["actions"][0]["resource"],
+            "operator": "exists",
+        }
+    ]
+    data["actions"][0]["postconditions"] = [
+        {
+            "name": "postcondition_must_be_verified",
+            "resource": data["actions"][0]["resource"],
+            "operator": "exists",
+        }
+    ]
+    data["confidence"] = 0.4
+    return MitigationPlan.model_validate(data)
+
+
+@dataclass
+class Candidate:
+    candidate_id: str
+    label: str
+    plan: MitigationPlan
+    reward: float
+    allowed: bool
+    deny_reason: str
+    x: np.ndarray
+
+
+def build_candidates(pair: dict[str, Any], rng: random.Random) -> list[Candidate]:
+    prompt = pair["prompt"]
+    chosen = MitigationPlan.model_validate(pair["chosen"])
+    rejected = MitigationPlan.model_validate(pair["rejected"])
+
+    raw = [
+        ("chosen_json_patch", chosen, 1.0),
+        ("rejected_delete_service", rejected, -1.0),
+        ("wrong_patch_value", make_wrong_patch_value(chosen, prompt), -0.8),
+        ("missing_test_precondition", make_missing_test(chosen), 0.45),
+        ("rollout_restart_decoy", make_rollout_restart(chosen), 0.0),
+        ("merge_patch_decoy", make_merge_patch_decoy(chosen), -0.25),
+    ]
+
+    rng.shuffle(raw)
+
+    candidates = []
+    for i, (label, plan, reward) in enumerate(raw):
+        allowed, reason = policy_allow(plan)
+        candidates.append(
+            Candidate(
+                candidate_id=f"{pair['pair_id']}::{i}::{label}",
+                label=label,
+                plan=plan,
+                reward=reward,
+                allowed=allowed,
+                deny_reason=reason,
+                x=feature_vector(plan, prompt),
+            )
+        )
+
+    return candidates
+
+
+class LinUCB:
+    def __init__(self, dim: int, alpha: float = 0.6, lambda_reg: float = 1.0):
+        self.dim = dim
+        self.alpha = alpha
+        self.A = lambda_reg * np.eye(dim, dtype=np.float64)
+        self.b = np.zeros(dim, dtype=np.float64)
+
+    def theta(self) -> np.ndarray:
+        return np.linalg.solve(self.A, self.b)
+
+    def score(self, x: np.ndarray) -> float:
+        theta = self.theta()
+        mean = float(theta @ x)
+        Ax = np.linalg.solve(self.A, x)
+        bonus = self.alpha * math.sqrt(float(x @ Ax))
+        return mean + bonus
+
+    def update(self, x: np.ndarray, reward: float) -> None:
+        self.A += np.outer(x, x)
+        self.b += reward * x
+
+
+def summarize(selections: list[dict[str, Any]]) -> dict[str, Any]:
+    n = max(len(selections), 1)
+    return {
+        "rounds": len(selections),
+        "avg_reward": sum(x["reward"] for x in selections) / n,
+        "selected_correct_rate": sum(x["selected_label"] == "chosen_json_patch" for x in selections) / n,
+        "oracle_success_rate": sum(x["reward"] >= 0.99 for x in selections) / n,
+        "unsafe_selected_rate": sum(not x["selected_allowed"] for x in selections) / n,
+        "avg_chosen_rank": (
+            sum(x["chosen_rank"] for x in selections if x.get("chosen_rank") is not None)
+            / max(sum(x.get("chosen_rank") is not None for x in selections), 1)
+        ),
+    }
+
+
+def chosen_rank_by_scores(safe_candidates: list[Candidate], scores: list[float]) -> int | None:
+    ranked = sorted(zip(safe_candidates, scores), key=lambda z: z[1], reverse=True)
+    for idx, (candidate, _) in enumerate(ranked, start=1):
+        if candidate.label == "chosen_json_patch":
+            return idx
+    return None
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--pairs", default="planner/data/preference_pairs.jsonl")
+    parser.add_argument("--out-dir", default="planner/bandit/results")
+    parser.add_argument("--alpha", type=float, default=0.6)
+    parser.add_argument("--lambda-reg", type=float, default=1.0)
+    parser.add_argument("--seed", type=int, default=42)
+    args = parser.parse_args()
+
+    rng = random.Random(args.seed)
+    pairs = read_jsonl(Path(args.pairs))
+
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    bandit = LinUCB(dim=len(FEATURE_NAMES), alpha=args.alpha, lambda_reg=args.lambda_reg)
+
+    trace_rows = []
+    linucb_rows = []
+    random_rows = []
+    minrisk_rows = []
+
+    total_blocked = 0
+    candidate_count = 0
+
+    for round_idx, pair in enumerate(pairs):
+        candidates = build_candidates(pair, rng)
+        safe_candidates = [c for c in candidates if c.allowed]
+        blocked_candidates = [c for c in candidates if not c.allowed]
+
+        total_blocked += len(blocked_candidates)
+        candidate_count += len(candidates)
+
+        if not safe_candidates:
+            continue
+
+        # Random baseline
+        random_selected = rng.choice(safe_candidates)
+        random_rows.append(
+            {
+                "round": round_idx,
+                "pair_id": pair["pair_id"],
+                "method": "random_safe",
+                "selected_label": random_selected.label,
+                "reward": random_selected.reward,
+                "selected_allowed": random_selected.allowed,
+                "chosen_rank": None,
+            }
+        )
+
+        # Min-risk heuristic: choose lowest risk; ties depend on shuffled candidate order.
+        risk_order = {"low": 0, "medium": 1, "high": 2, "blocked": 3}
+        minrisk_selected = sorted(
+            safe_candidates,
+            key=lambda c: risk_order.get(enum_value(first_action(c.plan).risk), 9),
+        )[0]
+        minrisk_rows.append(
+            {
+                "round": round_idx,
+                "pair_id": pair["pair_id"],
+                "method": "min_risk",
+                "selected_label": minrisk_selected.label,
+                "reward": minrisk_selected.reward,
+                "selected_allowed": minrisk_selected.allowed,
+                "chosen_rank": None,
+            }
+        )
+
+        # LinUCB
+        scores = [bandit.score(c.x) for c in safe_candidates]
+        best_idx = int(np.argmax(scores))
+        selected = safe_candidates[best_idx]
+        chosen_rank = chosen_rank_by_scores(safe_candidates, scores)
+
+        row = {
+            "round": round_idx,
+            "pair_id": pair["pair_id"],
+            "method": "linucb",
+            "selected_label": selected.label,
+            "reward": float(selected.reward),
+            "selected_allowed": selected.allowed,
+            "chosen_rank": chosen_rank,
+            "blocked_labels": [c.label for c in blocked_candidates],
+            "safe_labels": [c.label for c in safe_candidates],
+            "selected_features": {
+                name: float(value) for name, value in zip(FEATURE_NAMES, selected.x.tolist())
+            },
+            "scores": {
+                c.label: float(s) for c, s in zip(safe_candidates, scores)
+            },
+        }
+
+        linucb_rows.append(row)
+        trace_rows.append(row)
+
+        bandit.update(selected.x, selected.reward)
+
+    summary = {
+        "input_pairs": len(pairs),
+        "candidate_count": candidate_count,
+        "blocked_by_policy": total_blocked,
+        "feature_names": FEATURE_NAMES,
+        "alpha": args.alpha,
+        "lambda_reg": args.lambda_reg,
+        "methods": {
+            "random_safe": summarize(random_rows),
+            "min_risk": summarize(minrisk_rows),
+            "linucb": summarize(linucb_rows),
+        },
+        "scope": (
+            "Offline replay over targetPort preference pairs. Rewards are template/preference rewards, "
+            "not live AIOpsLab Oracle rewards."
+        ),
+    }
+
+    write_jsonl(out_dir / "offline_linucb_trace.jsonl", trace_rows)
+    (out_dir / "offline_linucb_summary.json").write_text(
+        json.dumps(summary, ensure_ascii=False, indent=2) + "\n"
+    )
+
+    theta = bandit.theta()
+    theta_rows = [
+        {"feature": name, "weight": float(weight)}
+        for name, weight in zip(FEATURE_NAMES, theta.tolist())
+    ]
+    (out_dir / "linucb_theta.json").write_text(
+        json.dumps(theta_rows, ensure_ascii=False, indent=2) + "\n"
+    )
+
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
+
+
+if __name__ == "__main__":
+    main()

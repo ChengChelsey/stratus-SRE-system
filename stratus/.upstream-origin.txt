@@ -1,0 +1,4 @@
+This directory was originally cloned from:
+  https://github.com/xlab-uiuc/stratus.git
+At commit: 4fc9a5b66bebbc5ddf2154c06e97f05db9385183
+Cloned/absorbed on: 2026-06-21, .git removed to detach upstream link.

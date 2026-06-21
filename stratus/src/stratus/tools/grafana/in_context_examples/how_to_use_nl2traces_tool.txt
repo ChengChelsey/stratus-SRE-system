@@ -1,0 +1,5 @@
+Here examples of queries you could ask the NL2Traces Tool:
+retrieve traces for payment-service for the last hour
+get traces for test-service for the last 15 minutes
+get GET traces for back-service for the last 15 minutes
+get POST traces from ticket-service for the last 5 minutes

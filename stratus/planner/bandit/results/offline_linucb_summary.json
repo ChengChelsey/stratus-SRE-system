@@ -1,0 +1,58 @@
+{
+  "input_pairs": 244,
+  "candidate_count": 1464,
+  "blocked_by_policy": 244,
+  "feature_names": [
+    "bias",
+    "diagnosis_alignment",
+    "op_json_patch",
+    "op_rollout_restart",
+    "op_merge_patch",
+    "op_delete",
+    "op_create_or_apply",
+    "resource_is_service",
+    "resource_name_match",
+    "namespace_match",
+    "has_targetport_replace",
+    "targetport_replace_value_match",
+    "has_targetport_test",
+    "targetport_test_value_match",
+    "patch_field_count_norm",
+    "action_count_norm",
+    "rollback_snapshot",
+    "risk_low",
+    "risk_medium",
+    "risk_high_or_blocked",
+    "preconditions_norm",
+    "postconditions_norm"
+  ],
+  "alpha": 0.6,
+  "lambda_reg": 1.0,
+  "methods": {
+    "random_safe": {
+      "rounds": 244,
+      "avg_reward": 0.12315573770491803,
+      "selected_correct_rate": 0.21311475409836064,
+      "oracle_success_rate": 0.21311475409836064,
+      "unsafe_selected_rate": 0.0,
+      "avg_chosen_rank": 0.0
+    },
+    "min_risk": {
+      "rounds": 244,
+      "avg_reward": 0.22725409836065572,
+      "selected_correct_rate": 0.3401639344262295,
+      "oracle_success_rate": 0.3401639344262295,
+      "unsafe_selected_rate": 0.0,
+      "avg_chosen_rank": 0.0
+    },
+    "linucb": {
+      "rounds": 244,
+      "avg_reward": 0.9788934426229507,
+      "selected_correct_rate": 0.9795081967213115,
+      "oracle_success_rate": 0.9795081967213115,
+      "unsafe_selected_rate": 0.0,
+      "avg_chosen_rank": 1.040983606557377
+    }
+  },
+  "scope": "Offline replay over targetPort preference pairs. Rewards are template/preference rewards, not live AIOpsLab Oracle rewards."
+}

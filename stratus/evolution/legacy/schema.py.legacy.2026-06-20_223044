@@ -1,0 +1,24 @@
+from dataclasses import dataclass
+from typing import Dict, Any, List
+
+
+@dataclass
+class Event:
+    type: str          # observation / action / tool / oracle
+    content: str
+    timestamp: str = ""
+
+
+@dataclass
+class Step:
+    agent: str
+    tool: str
+    action: str
+    result: str
+
+
+@dataclass
+class Episode:
+    episode_id: str
+    steps: List[Step]
+    success: bool

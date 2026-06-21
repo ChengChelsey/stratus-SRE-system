@@ -1,0 +1,55 @@
+{
+  "type": "object",
+  "properties": {
+    "entities": {
+      "type": "array",
+      "description": "List of entities involved in the fault analysis.",
+      "items": {
+        "type": "object",
+        "description": "An entity involved in the fault analysis.",
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "ID for the faulty entity from the topology. e.g. the ID (and not the name if possible) associated with the service, infrastructure, etc. that caused or was impacted by the incident. A fault entity can appear ONLY once in the fault propagation chain."
+          },
+          "root_cause": {
+            "type": "boolean",
+            "description": "Indicates whether the entity is the root cause of the fault. Atleast one entity must be the root cause entity."
+          }
+        },
+        "required": ["id", "root_cause"],
+        "additionalProperties": false
+      }
+    },
+    "propagations": {
+      "type": "array",
+      "description": "List of fault propagations between entities.",
+      "items": {
+        "type": "object",
+        "description": "A propagation of a fault from one entity to another.",
+        "properties": {
+          "source": {
+            "type": "string",
+            "description": "ID of the source entity where the fault originated."
+          },
+          "target": {
+            "type": "string",
+            "description": "ID of the target entity that is affected by the fault."
+          },
+          "condition": {
+            "type": "string",
+            "description": "Reason causing the faulty / erroneous behaviour between the source and target entities."
+          },
+          "effect": {
+            "type": "string",
+            "description": "Faulty behaviour between the two source and target entities observed as a result."
+          }
+        },
+        "required": ["source", "target", "condition", "effect"],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": ["entities", "propagations"],
+  "additionalProperties": false
+}

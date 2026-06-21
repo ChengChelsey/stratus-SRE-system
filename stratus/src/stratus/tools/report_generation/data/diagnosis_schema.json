@@ -1,0 +1,54 @@
+{
+  "type": "object",
+  "properties": {
+    "faults": {
+      "type": "array",
+      "description": "All faults propogation chains identified in the diagnosis.",
+      "items": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "description":"Fault propogation chain",
+          "properties": {
+            "fault_entity": {
+              "type": "string",
+              "description":"Name of the fault entity i.e., the service, infrastructure, etc. that caused or was impacted by the incident. A fault entity can appear ONLY once in the fault propagation chain."
+            },
+            "fault_entity_type": {
+              "type": "string",
+              "description":"Type of the fault entity, e.g., Pod, Service, Deployment, Endpoint, Configuration Map, Other, etc."
+            },
+            "fault_condition": {
+              "type": "array",
+              "description": "Corresponding reasons summarizing why the error or fault happened to the fault entity." ,
+              "items": {
+                "type": "object",
+                "properties": {
+                  "condition": {
+                      "type": "string"
+                    }
+                },
+                "required": [
+                  "condition"
+                ]
+              }
+            },
+            "root_cause": {
+              "type": "boolean",
+              "description": "Whether the entity is the root cause of the fault. Each fault propogation chain must have EXACTLY one root cause. Keep in mind that the root cause of an issue is often located upstream from the alert, as errors typically propagate backward to it."
+            }
+          },
+          "required": [
+            "fault_entity",
+            "fault_entity_type",
+            "fault_condition",
+            "root_cause"
+          ]
+    }
+  }
+}
+},
+"required": [
+"faults"
+]
+}

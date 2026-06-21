@@ -1,0 +1,90 @@
+[
+  {
+    "feature": "bias",
+    "weight": -0.037706364914075516
+  },
+  {
+    "feature": "diagnosis_alignment",
+    "weight": 0.08695252541577055
+  },
+  {
+    "feature": "op_json_patch",
+    "weight": -0.04001530145536378
+  },
+  {
+    "feature": "op_rollout_restart",
+    "weight": 0.031937822099921964
+  },
+  {
+    "feature": "op_merge_patch",
+    "weight": -0.029628885558627985
+  },
+  {
+    "feature": "op_delete",
+    "weight": 0.0
+  },
+  {
+    "feature": "op_create_or_apply",
+    "weight": 0.0
+  },
+  {
+    "feature": "resource_is_service",
+    "weight": -0.06964418701401329
+  },
+  {
+    "feature": "resource_name_match",
+    "weight": -0.037706364914077695
+  },
+  {
+    "feature": "namespace_match",
+    "weight": -0.03770636491409126
+  },
+  {
+    "feature": "has_targetport_replace",
+    "weight": -0.04001530145536453
+  },
+  {
+    "feature": "targetport_replace_value_match",
+    "weight": 0.8714615625773751
+  },
+  {
+    "feature": "has_targetport_test",
+    "weight": 0.19743152267075514
+  },
+  {
+    "feature": "targetport_test_value_match",
+    "weight": 0.19743152267075276
+  },
+  {
+    "feature": "patch_field_count_norm",
+    "weight": -0.008003060291050646
+  },
+  {
+    "feature": "action_count_norm",
+    "weight": -0.007541272982794444
+  },
+  {
+    "feature": "rollback_snapshot",
+    "weight": -0.06964418701399676
+  },
+  {
+    "feature": "risk_low",
+    "weight": -0.040015301455369356
+  },
+  {
+    "feature": "risk_medium",
+    "weight": 0.0023089365412940622
+  },
+  {
+    "feature": "risk_high_or_blocked",
+    "weight": 0.0
+  },
+  {
+    "feature": "preconditions_norm",
+    "weight": 0.07943439637660824
+  },
+  {
+    "feature": "postconditions_norm",
+    "weight": -0.023547393564933992
+  }
+]

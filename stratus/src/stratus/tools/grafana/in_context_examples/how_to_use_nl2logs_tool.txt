@@ -1,0 +1,5 @@
+Here are examples of queries you could ask the NL2Logs Tool:
+get the logs from the payment deployment
+get all logs from deployment back
+get the logs from the worker-node-1 kubernetes host
+get the logs from the payment service with label app=payment

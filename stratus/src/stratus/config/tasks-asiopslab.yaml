@@ -1,0 +1,50 @@
+sre_diagnosis_tool_task:
+  description: 
+    Diagnose the problem in the cloud. Use the tools provided to gather information to help you with diagnosis.
+    Diagnosis needs to go as deep as possible. In some cases you should follow the information like logs of errorneous services to find the root cause.
+    The problem description is '''{problem_desc}'''.
+    The you have some reflection from the previous run '''{previous_run}'''
+    You should use submission tool to submit your answer.
+  expected_output: 
+    Something helpful for next retry.
+  agent: sre_diagnosis_agent
+
+diagnosis_json_generation_task:
+  description: >
+    Generate a JSON-structured diagnosis report.
+  expected_output: >
+    A JSON-structured diagnosis report.
+  agent: sre_diagnosis_agent
+    
+sre_mitigation_task:
+  description: >
+    The problem description is '''{problem_desc}'''.
+    The you have some reflection from the previous run '''{previous_run}'''
+    If the previous run already has a mitigation plan, you should follow it. If not, you should create a new mitigation plan.
+    You SHOULD USE THE TOOLS provided to mitigate the problem. And feel free to apply changes to the system.
+  expected_output: >
+    Since you failed to mitigate in this run, please output something you think is useful for the next attempt of mitigation. Like your conclusion about the root cause and the mitigation plan which you have not take action on it yet.
+  agent: sre_mitigation_agent
+
+mitigation_json_generation_task:
+  description: >
+    Generate a JSON-structured mitigation report.
+  expected_output: >
+    A JSON-structured mitigation report listing all steps taken to mitigate the IT incident.
+  agent: sre_mitigation_agent
+
+sre_rollback_task:
+  description: >
+    You are given a system and a rollback tool. The system is either in a initial faulty state, or in the state you left it incompletely repaired after the previous round of mitigation. You need to rollback the system to the initial state since the operations you performed in the previous round may negatively impact your current round of mitigation.
+
+    You should run the rollback tool as many times as you can, since this rollback tool undos the last operation performed on the system. You should run the rollback tool until it returns that there are no more operations to undo.
+  expected_output: >
+    None.
+  agent: sre_rollback_agent
+
+initial_analysis_task:
+  description: >
+    Analyze the traces to localize which part of the system, e.g., a service, a component, a pod, a node, etc., has anomalies. Always use the get_traces tool first; then use a read_traces tool to help you with the localization. Note that it may not be helpful to use the tools too many times. You are working on the namespace '{namespace}', please use this namespace when using the tools.
+  expected_output: >
+    A list of entities that have anomalies. Also, annotate the possible root cause entity of the anomalies and denote that the following analysis can start from that/those root cause entity(ies). Do not make up service names. Use the service names output by the tool. If the tool does not output any services, you can output an empty list.
+  agent: sre_diagnosis_agent

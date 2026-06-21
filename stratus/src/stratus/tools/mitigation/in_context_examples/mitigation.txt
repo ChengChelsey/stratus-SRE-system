@@ -1,0 +1,18 @@
+EXAMPLE INPUTS AND OUTPUTS
+
+INPUT: Low disk capacity on a host
+OUTPUT: 1. If there are files which are stale or no longer needed, consider permanently deleting them. 
+2. If there are rougue processes filling up the disk, consider terminating them. 
+3. If there are no anomalies in the disk activity you can either increase the host disk capcitiy or move files to another disk.
+
+INPUT: OutOfMemory error in the deployment manager when trying to install applications
+OUTPUT: 1. Check the options you specified on the Java virtual machine page of the administrative console. 
+2. Increase the maximumHeapSize in the Java virtual machine settings of the deployment manager. 
+3. restart the deployment manager, and try installing the application again.
+
+INPUT: Shard assignments failed (ES event: shard unassigned)
+OUTPUT: 1. Recreate new shards. 
+2. Trigger node rebalance.
+3. Assert Elasticsearch recovered.
+
+END OF EXAMPLES
