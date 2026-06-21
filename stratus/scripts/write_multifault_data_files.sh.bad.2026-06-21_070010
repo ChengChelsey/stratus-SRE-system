@@ -1,0 +1,756 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PROJECT_ROOT="${1:-$PWD}"
+cd "$PROJECT_ROOT"
+
+mkdir -p evolution scripts planner/data_multifault
+
+if [ -f evolution/build_multifault_data.py ]; then
+  cp evolution/build_multifault_data.py evolution/build_multifault_data.py.bak.$(date +%F_%H%M%S)
+fi
+
+cat > evolution/build_multifault_data.py <<'PY'
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import random
+from collections import Counter
+from pathlib import Path
+from typing import Any
+
+from planner.schema import (
+    ActionPlan,
+    Condition,
+    EvidenceItem,
+    JsonPatchOp,
+    MitigationPlan,
+    OperationType,
+    PreferencePair,
+    ResourceKind,
+    ResourceRef,
+    RiskLevel,
+)
+
+SYSTEM_PROMPT = (
+    "You are a Kubernetes SRE Mitigation Planner. "
+    "Given observability evidence, output ONLY one JSON object that matches the MitigationPlan schema. "
+    "Prefer minimal reversible changes. Do not delete and recreate resources when a single-field patch fixes the issue."
+)
+
+NAMESPACES = [
+    "test-social-network",
+    "staging-social-network",
+    "prod-social-network",
+    "canary-social-network",
+]
+
+DEPLOYMENTS = [
+    "user-service",
+    "text-service",
+    "compose-post-service",
+    "media-service",
+    "user-mention-service",
+    "home-timeline-service",
+]
+
+NODES = [
+    "extra-node",
+    "missing-node",
+    "gpu-node-404",
+    "not-ready-worker",
+    "phantom-node",
+]
+
+
+def read_jsonl(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    rows = []
+    with path.open(encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                rows.append(json.loads(line))
+    return rows
+
+
+def write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def stable_bucket(text: str) -> int:
+    return int(hashlib.sha256(text.encode()).hexdigest(), 16) % 10
+
+
+def split_name(sample_id: str) -> str:
+    bucket = stable_bucket(sample_id)
+    if bucket < 8:
+        return "train"
+    if bucket == 8:
+        return "val"
+    return "test"
+
+
+def make_sft_sample(
+    *,
+    sample_id: str,
+    prompt: str,
+    plan: MitigationPlan,
+    metadata: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "id": sample_id,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+            {"role": "assistant", "content": plan.model_dump_json(exclude_none=True)},
+        ],
+        "metadata": metadata,
+    }
+
+
+def make_toolcall_sample(sample: dict[str, Any]) -> dict[str, Any]:
+    plan_json = sample["messages"][-1]["content"]
+    return {
+        "id": sample["id"],
+        "messages": [
+            sample["messages"][0],
+            sample["messages"][1],
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "generate_mitigation_plan",
+                            "arguments": plan_json,
+                        },
+                    }
+                ],
+            },
+        ],
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "generate_mitigation_plan",
+                    "description": "Generate a safe Kubernetes mitigation plan.",
+                    "parameters": MitigationPlan.model_json_schema(),
+                },
+            }
+        ],
+        "metadata": sample.get("metadata", {}),
+    }
+
+
+def make_scale_prompt(namespace: str, deployment: str, before: int, after: int) -> str:
+    observation = {
+        "namespace": namespace,
+        "symptom": (
+            f"Service endpoints for {deployment} are empty and dependent services report connection refused."
+        ),
+        "kubernetes_evidence": {
+            "deployment": {
+                "kind": "Deployment",
+                "name": deployment,
+                "replicas": before,
+                "availableReplicas": 0,
+                "readyReplicas": 0,
+            },
+            "pods": {
+                "label_selector": f"service={deployment}",
+                "running_count": 0,
+                "expected_count": after,
+            },
+            "service": {
+                "kind": "Service",
+                "name": deployment,
+                "endpoints": [],
+            },
+            "event": f"Deployment {deployment} was scaled down to {before} replicas.",
+        },
+        "instruction": "Generate the safest minimal mitigation plan. Return JSON only.",
+    }
+    return json.dumps(observation, ensure_ascii=False)
+
+
+def make_scale_plan(
+    *,
+    task_id: str,
+    namespace: str,
+    deployment: str,
+    before: int = 0,
+    after: int = 1,
+    confidence: float = 0.94,
+) -> MitigationPlan:
+    resource = ResourceRef(kind=ResourceKind.DEPLOYMENT, namespace=namespace, name=deployment)
+    service = ResourceRef(kind=ResourceKind.SERVICE, namespace=namespace, name=deployment)
+
+    return MitigationPlan(
+        task_id=task_id,
+        fault_type="deployment_scaled_to_zero",
+        root_cause=resource,
+        evidence=[
+            EvidenceItem(
+                source="kubernetes",
+                description=f"Deployment {deployment} has spec.replicas={before}.",
+                resource=resource,
+                key="/spec/replicas",
+                value=before,
+            ),
+            EvidenceItem(
+                source="kubernetes",
+                description=f"No running pods match service={deployment}; Service endpoints are empty.",
+                resource=service,
+                key="endpoints",
+                value=[],
+            ),
+            EvidenceItem(
+                source="log",
+                description=f"Dependent services cannot connect to {deployment}.",
+            ),
+        ],
+        actions=[
+            ActionPlan(
+                tool="k8s_change",
+                operation=OperationType.JSON_PATCH,
+                resource=resource,
+                patch=[
+                    JsonPatchOp(op="test", path="/spec/replicas", value=before),
+                    JsonPatchOp(op="replace", path="/spec/replicas", value=after),
+                ],
+                risk=RiskLevel.LOW,
+                reason="Restore the Deployment replica count with a minimal reversible JSON Patch.",
+                preconditions=[
+                    Condition(
+                        name="deployment_scaled_to_zero",
+                        resource=resource,
+                        path="/spec/replicas",
+                        operator="eq",
+                        expected=before,
+                    )
+                ],
+                postconditions=[
+                    Condition(
+                        name="deployment_replica_count_restored",
+                        resource=resource,
+                        path="/spec/replicas",
+                        operator="eq",
+                        expected=after,
+                    ),
+                    Condition(
+                        name="deployment_pods_ready",
+                        resource=resource,
+                        path="pods",
+                        operator="ready",
+                    ),
+                    Condition(
+                        name="service_endpoints_non_empty",
+                        resource=service,
+                        path="endpoints",
+                        operator="non_empty",
+                    ),
+                    Condition(
+                        name="workload_oracle_passes",
+                        operator="oracle_pass",
+                    ),
+                ],
+                rollback="resource_snapshot",
+            )
+        ],
+        confidence=confidence,
+    )
+
+
+def make_assign_prompt(namespace: str, deployment: str, bad_node: str) -> str:
+    observation = {
+        "namespace": namespace,
+        "symptom": f"Pod for {deployment} is Pending and dependent services report connection refused.",
+        "kubernetes_evidence": {
+            "deployment": {
+                "kind": "Deployment",
+                "name": deployment,
+                "replicas": 1,
+                "nodeSelector": {"kubernetes.io/hostname": bad_node},
+            },
+            "pod": {
+                "status": "Pending",
+                "reason": "unschedulable",
+                "message": f"node(s) did not match node selector kubernetes.io/hostname={bad_node}",
+            },
+            "cluster_nodes": [
+                {"name": "kind-control-plane", "schedulable": False},
+                {"name": "kind-worker", "schedulable": True},
+            ],
+            "nonexistent_node": bad_node,
+        },
+        "instruction": "Generate the safest minimal mitigation plan. Return JSON only.",
+    }
+    return json.dumps(observation, ensure_ascii=False)
+
+
+def make_assign_plan(
+    *,
+    task_id: str,
+    namespace: str,
+    deployment: str,
+    bad_node: str = "extra-node",
+    confidence: float = 0.93,
+) -> MitigationPlan:
+    resource = ResourceRef(kind=ResourceKind.DEPLOYMENT, namespace=namespace, name=deployment)
+    service = ResourceRef(kind=ResourceKind.SERVICE, namespace=namespace, name=deployment)
+
+    return MitigationPlan(
+        task_id=task_id,
+        fault_type="deployment_node_selector_nonexistent_node",
+        root_cause=resource,
+        evidence=[
+            EvidenceItem(
+                source="kubernetes",
+                description=(
+                    f"Deployment {deployment} has nodeSelector kubernetes.io/hostname={bad_node}."
+                ),
+                resource=resource,
+                key="/spec/template/spec/nodeSelector",
+                value={"kubernetes.io/hostname": bad_node},
+            ),
+            EvidenceItem(
+                source="kubernetes",
+                description=f"No node named {bad_node} exists in the cluster.",
+                key="cluster.nodes",
+                value=["kind-control-plane", "kind-worker"],
+            ),
+            EvidenceItem(
+                source="kubernetes",
+                description=f"Pod for {deployment} is Pending because it cannot be scheduled.",
+                resource=resource,
+                key="pod.status",
+                value="Pending",
+            ),
+        ],
+        actions=[
+            ActionPlan(
+                tool="k8s_change",
+                operation=OperationType.JSON_PATCH,
+                resource=resource,
+                patch=[
+                    JsonPatchOp(
+                        op="test",
+                        path="/spec/template/spec/nodeSelector/kubernetes.io~1hostname",
+                        value=bad_node,
+                    ),
+                    JsonPatchOp(
+                        op="remove",
+                        path="/spec/template/spec/nodeSelector",
+                    ),
+                ],
+                risk=RiskLevel.LOW,
+                reason=(
+                    "Remove the invalid nodeSelector so the Deployment can schedule pods on available nodes."
+                ),
+                preconditions=[
+                    Condition(
+                        name="node_selector_points_to_nonexistent_node",
+                        resource=resource,
+                        path="/spec/template/spec/nodeSelector/kubernetes.io~1hostname",
+                        operator="eq",
+                        expected=bad_node,
+                    )
+                ],
+                postconditions=[
+                    Condition(
+                        name="node_selector_removed",
+                        resource=resource,
+                        path="/spec/template/spec/nodeSelector",
+                        operator="ne",
+                        expected={"kubernetes.io/hostname": bad_node},
+                    ),
+                    Condition(
+                        name="deployment_pods_ready",
+                        resource=resource,
+                        path="pods",
+                        operator="ready",
+                    ),
+                    Condition(
+                        name="service_endpoints_non_empty",
+                        resource=service,
+                        path="endpoints",
+                        operator="non_empty",
+                    ),
+                    Condition(
+                        name="workload_oracle_passes",
+                        operator="oracle_pass",
+                    ),
+                ],
+                rollback="resource_snapshot",
+            )
+        ],
+        confidence=confidence,
+    )
+
+
+def make_delete_rejected(chosen: MitigationPlan, reason: str) -> MitigationPlan:
+    resource = chosen.root_cause
+    return MitigationPlan(
+        task_id=chosen.task_id,
+        fault_type=chosen.fault_type,
+        root_cause=resource,
+        evidence=[
+            EvidenceItem(
+                source="agent",
+                description=reason,
+                resource=resource,
+            )
+        ],
+        actions=[
+            ActionPlan(
+                tool="NL2Kubectl Tool",
+                operation=OperationType.DELETE,
+                resource=resource,
+                patch=[],
+                risk=RiskLevel.HIGH,
+                reason=reason,
+                preconditions=[Condition(name="resource_exists", resource=resource)],
+                postconditions=[Condition(name="resource_recreated_or_recovered", resource=resource)],
+                rollback="resource_snapshot",
+            )
+        ],
+        confidence=0.2,
+    )
+
+
+def prompt_from_sample(sample: dict[str, Any]) -> str:
+    return sample["messages"][1]["content"]
+
+
+def load_existing_targetport_samples(old_data_dir: Path) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for name in ["sft_train.jsonl", "sft_val.jsonl", "sft_test.jsonl"]:
+        for row in read_jsonl(old_data_dir / name):
+            row = dict(row)
+            row["id"] = "targetport_existing::" + row["id"]
+            row.setdefault("metadata", {})
+            row["metadata"]["included_in_multifault_dataset"] = True
+            rows.append(row)
+    return rows
+
+
+def verified_scale_samples() -> list[dict[str, Any]]:
+    runs = [
+        "06-21_02-41-44-scale_pod_zero_social_net-mitigation-1",
+        "06-21_03-19-38-scale_pod_zero_social_net-mitigation-1",
+        "06-21_04-38-19-scale_pod_zero_social_net-mitigation-1",
+    ]
+    samples = []
+    for i, run in enumerate(runs):
+        task_id = f"verified_scale_pod_zero_{i}"
+        plan = make_scale_plan(
+            task_id=task_id,
+            namespace="test-social-network",
+            deployment="user-service",
+            before=0,
+            after=1,
+            confidence=0.97,
+        )
+        prompt = make_scale_prompt("test-social-network", "user-service", 0, 1)
+        samples.append(
+            make_sft_sample(
+                sample_id=f"verified_scale::{run}",
+                prompt=prompt,
+                plan=plan,
+                metadata={
+                    "source": "verified_live_scale_pod_zero_episode",
+                    "episode_id": run,
+                    "fault_family": "scale_pod_zero_social_net",
+                    "success": True,
+                },
+            )
+        )
+    return samples
+
+
+def verified_assign_samples() -> list[dict[str, Any]]:
+    runs = [
+        "06-21_04-57-51-assign_to_non_existent_node_social_net-mitigation-1",
+        "06-21_05-11-14-assign_to_non_existent_node_social_net-mitigation-1",
+        "06-21_05-47-14-assign_to_non_existent_node_social_net-mitigation-1",
+    ]
+    samples = []
+    for i, run in enumerate(runs):
+        task_id = f"verified_assign_nonexistent_node_{i}"
+        plan = make_assign_plan(
+            task_id=task_id,
+            namespace="test-social-network",
+            deployment="user-service",
+            bad_node="extra-node",
+            confidence=0.97,
+        )
+        prompt = make_assign_prompt("test-social-network", "user-service", "extra-node")
+        samples.append(
+            make_sft_sample(
+                sample_id=f"verified_assign::{run}",
+                prompt=prompt,
+                plan=plan,
+                metadata={
+                    "source": "verified_live_assign_nonexistent_node_episode",
+                    "episode_id": run,
+                    "fault_family": "assign_to_non_existent_node_social_net",
+                    "success": True,
+                },
+            )
+        )
+    return samples
+
+
+def synthetic_scale_samples(count: int, seed: int) -> list[dict[str, Any]]:
+    rng = random.Random(seed + 100)
+    samples = []
+    for i in range(count):
+        ns = rng.choice(NAMESPACES)
+        deployment = rng.choice(DEPLOYMENTS)
+        after = rng.choice([1, 2])
+        task_id = f"synthetic_scale_pod_zero_{i:04d}"
+        plan = make_scale_plan(
+            task_id=task_id,
+            namespace=ns,
+            deployment=deployment,
+            before=0,
+            after=after,
+            confidence=0.9,
+        )
+        prompt = make_scale_prompt(ns, deployment, 0, after)
+        samples.append(
+            make_sft_sample(
+                sample_id=f"synthetic_scale::{i:04d}::{ns}::{deployment}::0->{after}",
+                prompt=prompt,
+                plan=plan,
+                metadata={
+                    "source": "synthetic_from_verified_scale_pod_zero_template",
+                    "fault_family": "scale_pod_zero_social_net",
+                    "namespace": ns,
+                    "deployment": deployment,
+                    "before": 0,
+                    "after": after,
+                },
+            )
+        )
+    return samples
+
+
+def synthetic_assign_samples(count: int, seed: int) -> list[dict[str, Any]]:
+    rng = random.Random(seed + 200)
+    samples = []
+    for i in range(count):
+        ns = rng.choice(NAMESPACES)
+        deployment = rng.choice(DEPLOYMENTS)
+        bad_node = rng.choice(NODES)
+        task_id = f"synthetic_assign_nonexistent_node_{i:04d}"
+        plan = make_assign_plan(
+            task_id=task_id,
+            namespace=ns,
+            deployment=deployment,
+            bad_node=bad_node,
+            confidence=0.9,
+        )
+        prompt = make_assign_prompt(ns, deployment, bad_node)
+        samples.append(
+            make_sft_sample(
+                sample_id=f"synthetic_assign::{i:04d}::{ns}::{deployment}::{bad_node}",
+                prompt=prompt,
+                plan=plan,
+                metadata={
+                    "source": "synthetic_from_verified_assign_nonexistent_node_template",
+                    "fault_family": "assign_to_non_existent_node_social_net",
+                    "namespace": ns,
+                    "deployment": deployment,
+                    "bad_node": bad_node,
+                },
+            )
+        )
+    return samples
+
+
+def build_preference_pairs(samples: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    pairs = []
+    for sample in samples:
+        try:
+            chosen = MitigationPlan.model_validate_json(sample["messages"][-1]["content"])
+        except Exception:
+            continue
+
+        if chosen.fault_type == "deployment_scaled_to_zero":
+            reason = (
+                "Rejected: deleting the Deployment is dangerous and unnecessary; "
+                "the minimal fix is to restore /spec/replicas."
+            )
+        elif chosen.fault_type == "deployment_node_selector_nonexistent_node":
+            reason = (
+                "Rejected: deleting the Deployment is dangerous and unnecessary; "
+                "the minimal fix is to remove the invalid nodeSelector."
+            )
+        else:
+            reason = (
+                "Rejected: deleting and recreating the resource is not a minimal fix "
+                "when a single-field patch is sufficient."
+            )
+
+        rejected = make_delete_rejected(chosen, reason)
+
+        pair = PreferencePair(
+            pair_id="pair::" + sample["id"],
+            prompt=prompt_from_sample(sample),
+            chosen=chosen,
+            rejected=rejected,
+            reason=reason,
+            source_episode=sample.get("metadata", {}).get("episode_id"),
+        )
+        pairs.append(pair.model_dump(mode="json"))
+    return pairs
+
+
+def summarize_samples(samples: list[dict[str, Any]]) -> dict[str, Any]:
+    fault_counter = Counter()
+    source_counter = Counter()
+    split_counter = Counter()
+
+    for sample in samples:
+        split_counter[split_name(sample["id"])] += 1
+        source_counter[sample.get("metadata", {}).get("source", "unknown")] += 1
+        try:
+            plan = MitigationPlan.model_validate_json(sample["messages"][-1]["content"])
+            fault_counter[plan.fault_type] += 1
+        except Exception:
+            fault_counter["invalid"] += 1
+
+    return {
+        "total": len(samples),
+        "by_split": dict(split_counter),
+        "by_fault_type": dict(fault_counter),
+        "by_source": dict(source_counter),
+    }
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--old-data-dir", default="planner/data")
+    parser.add_argument("--out-dir", default="planner/data_multifault")
+    parser.add_argument("--augment-scale", type=int, default=160)
+    parser.add_argument("--augment-assign", type=int, default=160)
+    parser.add_argument("--seed", type=int, default=42)
+    args = parser.parse_args()
+
+    old_data_dir = Path(args.old_data_dir)
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    samples: list[dict[str, Any]] = []
+    samples.extend(load_existing_targetport_samples(old_data_dir))
+    samples.extend(verified_scale_samples())
+    samples.extend(verified_assign_samples())
+    samples.extend(synthetic_scale_samples(args.augment_scale, args.seed))
+    samples.extend(synthetic_assign_samples(args.augment_assign, args.seed))
+
+    dedup = {sample["id"]: sample for sample in samples}
+    samples = list(dedup.values())
+
+    # Validate all assistant labels.
+    for sample in samples:
+        MitigationPlan.model_validate_json(sample["messages"][-1]["content"])
+
+    splits = {"train": [], "val": [], "test": []}
+    for sample in samples:
+        splits[split_name(sample["id"])].append(sample)
+
+    write_jsonl(out_dir / "sft_train.jsonl", splits["train"])
+    write_jsonl(out_dir / "sft_val.jsonl", splits["val"])
+    write_jsonl(out_dir / "sft_test.jsonl", splits["test"])
+
+    toolcall_samples = [make_toolcall_sample(sample) for sample in samples]
+    tool_splits = {"train": [], "val": [], "test": []}
+    for sample in toolcall_samples:
+        tool_splits[split_name(sample["id"])].append(sample)
+
+    write_jsonl(out_dir / "toolcall_train.jsonl", tool_splits["train"])
+    write_jsonl(out_dir / "toolcall_val.jsonl", tool_splits["val"])
+    write_jsonl(out_dir / "toolcall_test.jsonl", tool_splits["test"])
+
+    pairs = build_preference_pairs(samples)
+    write_jsonl(out_dir / "preference_pairs.jsonl", pairs)
+
+    (out_dir / "mitigation_plan.schema.json").write_text(
+        json.dumps(MitigationPlan.model_json_schema(), ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+    summary = {
+        "old_data_dir": str(old_data_dir),
+        "out_dir": str(out_dir),
+        "augment_scale": args.augment_scale,
+        "augment_assign": args.augment_assign,
+        "seed": args.seed,
+        "sft_total": len(samples),
+        "toolcall_total": len(toolcall_samples),
+        "preference_pairs": len(pairs),
+        "summary": summarize_samples(samples),
+        "note": (
+            "Multi-fault dataset includes existing targetPort samples plus verified and parameterized "
+            "scale_pod_zero / assign_to_non_existent_node samples. Parameterized samples are synthetic "
+            "template augmentations and are not additional live AIOpsLab episodes."
+        ),
+    }
+    (out_dir / "dataset_summary.json").write_text(
+        json.dumps(summary, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
+
+
+if __name__ == "__main__":
+    main()
+PY
+
+cat > scripts/run_build_multifault_data.sh <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+python -m evolution.build_multifault_data \
+  --old-data-dir planner/data \
+  --out-dir planner/data_multifault \
+  --augment-scale 160 \
+  --augment-assign 160 \
+  --seed 42
+
+echo
+echo "=== Multi-fault dataset summary ==="
+cat planner/data_multifault/dataset_summary.json
+
+echo
+echo "=== File counts ==="
+wc -l planner/data_multifault/*.jsonl
+
+echo
+echo "=== Fault type counts ==="
+python - <<'PY'
+import json
+from collections import Counter
+from pathlib import Path
+from planner.schema import MitigationPlan
+
+for name in ["sft_train.jsonl", "sft_val.jsonl", "sft_test.jsonl"]:
+    c = Counter()
+    p = Path("planner/data_multifault") / name
+    for line in p.read_text().splitlines():
+        row = json.loads(line)
+        plan = MitigationPlan.model_validate_json(row["messages"][-1]["content"])
+        c[plan.fault_type] += 1
+    print(name, dict(c))
+PY

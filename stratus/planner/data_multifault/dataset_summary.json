@@ -1,0 +1,32 @@
+{
+  "old_data_dir": "planner/data",
+  "out_dir": "planner/data_multifault",
+  "augment_scale": 160,
+  "augment_assign": 160,
+  "seed": 42,
+  "sft_total": 570,
+  "toolcall_total": 570,
+  "preference_pairs": 570,
+  "summary": {
+    "total": 570,
+    "by_split": {
+      "train": 462,
+      "val": 53,
+      "test": 55
+    },
+    "by_fault_type": {
+      "service_target_port_mismatch": 244,
+      "deployment_scaled_to_zero": 163,
+      "deployment_node_selector_nonexistent_node": 163
+    },
+    "by_source": {
+      "verified_episode": 4,
+      "synthetic_from_verified_targetport_template": 240,
+      "verified_live_scale_pod_zero_episode": 3,
+      "verified_live_assign_nonexistent_node_episode": 3,
+      "synthetic_from_verified_scale_pod_zero_template": 160,
+      "synthetic_from_verified_assign_nonexistent_node_template": 160
+    }
+  },
+  "note": "Multi-fault dataset includes existing targetPort samples plus verified and parameterized scale_pod_zero / assign_to_non_existent_node samples. Parameterized samples are synthetic template augmentations and are not additional live AIOpsLab episodes."
+}
