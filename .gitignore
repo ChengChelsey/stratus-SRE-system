@@ -33,8 +33,17 @@ stratus/outputs/
 stratus/eval/*/
 stratus/kubectl_states/
 
-# ===== 实验产物（1.3G，可重新生成）=====
-artifacts/
+# ===== 实验产物：默认全部忽略，按需放行 =====
+artifacts/**
+
+# 必须放行子目录，git 才能下钻到深层文件
+!artifacts/**/
+
+# planner_data：全部保留（训练数据集，444K）
+!artifacts/planner_data/**
+
+# artifacts 下所有 .md 文档都保留（模型权重/大文件仍忽略）
+!artifacts/**/*.md
 
 # ===== Claude 本地配置（整个目录忽略）=====
 .claude/
