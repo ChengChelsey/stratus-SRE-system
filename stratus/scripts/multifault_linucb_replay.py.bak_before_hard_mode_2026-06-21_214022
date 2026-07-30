@@ -1,0 +1,781 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import copy
+import csv
+import json
+import math
+import random
+import statistics
+from collections import Counter, defaultdict
+from pathlib import Path
+from typing import Any
+
+try:
+    import numpy as np
+except Exception as exc:
+    raise SystemExit('This script requires numpy. Install it with: pip install numpy') from exc
+
+
+CANONICAL_FAULTS = {
+    'service_target_port_mismatch',
+    'deployment_scaled_to_zero',
+    'deployment_node_selector_nonexistent_node',
+}
+
+RISK_SCORE = {'low': 0, 'medium': 1, 'high': 2, None: 1}
+BLOCKED_OPERATIONS = {'delete', 'create', 'apply_yaml', 'kubectl_delete'}
+
+FEATURE_NAMES = [
+    'bias',
+    'risk_low', 'risk_medium', 'risk_high',
+    'op_json_patch', 'op_merge_patch', 'op_delete', 'op_other',
+    'kind_service', 'kind_deployment', 'kind_other',
+    'fault_targetport', 'fault_scale', 'fault_assign',
+    'has_test', 'has_replace', 'has_remove', 'has_add', 'has_mutation',
+    'patch_len_norm',
+    'path_targetport', 'path_replicas', 'path_node_selector', 'path_unknown',
+    'align_targetport_path', 'align_scale_path', 'align_assign_path',
+    'align_targetport_kind', 'align_deployment_kind',
+    'value_targetport_9090', 'value_replicas_1', 'value_remove_node_selector',
+    'has_preconditions', 'has_postconditions', 'has_rollback',
+    'unsafe_like', 'path_count_norm',
+]
+
+
+def read_jsonl(path: Path) -> list[dict[str, Any]]:
+    rows = []
+    with path.open('r', encoding='utf-8') as f:
+        for line_no, line in enumerate(f, 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except Exception as exc:
+                print(f'[WARN] skip invalid JSON line {line_no}: {exc}')
+    return rows
+
+
+def maybe_parse_json(x: Any) -> Any:
+    if isinstance(x, str):
+        s = x.strip()
+        if (s.startswith('{') and s.endswith('}')) or (s.startswith('[') and s.endswith(']')):
+            try:
+                return json.loads(s)
+            except Exception:
+                return x
+    return x
+
+
+def extract_plan(row: dict[str, Any]) -> dict[str, Any] | None:
+    # Robustly handles common preference-pair formats.
+    candidate_keys = [
+        'chosen', 'chosen_plan', 'positive', 'accepted', 'gold', 'target', 'plan',
+        'mitigation_plan', 'response', 'assistant', 'label'
+    ]
+    for k in candidate_keys:
+        if k in row:
+            obj = maybe_parse_json(row[k])
+            if isinstance(obj, dict) and ('actions' in obj or 'fault_type' in obj):
+                return obj
+            if isinstance(obj, dict) and 'content' in obj:
+                content = maybe_parse_json(obj.get('content'))
+                if isinstance(content, dict) and ('actions' in content or 'fault_type' in content):
+                    return content
+
+    # Messages-style fallback: use last assistant message content.
+    for k in ['messages', 'chosen_messages', 'conversation']:
+        msgs = row.get(k)
+        if isinstance(msgs, list):
+            for m in reversed(msgs):
+                if not isinstance(m, dict):
+                    continue
+                content = maybe_parse_json(m.get('content'))
+                if isinstance(content, dict) and ('actions' in content or 'fault_type' in content):
+                    return content
+    return None
+
+
+def first_action(plan: dict[str, Any]) -> dict[str, Any]:
+    actions = plan.get('actions') or []
+    if actions and isinstance(actions[0], dict):
+        return actions[0]
+    return {}
+
+
+def patch_ops(action: dict[str, Any]) -> list[dict[str, Any]]:
+    patch = action.get('patch') or []
+    return [p for p in patch if isinstance(p, dict)]
+
+
+def canonical_fault_type(plan: dict[str, Any]) -> str:
+    ft = str(plan.get('fault_type') or '')
+    action = first_action(plan)
+    paths = [p.get('path') for p in patch_ops(action) if p.get('path')]
+
+    if any(str(p).endswith('/targetPort') for p in paths):
+        return 'service_target_port_mismatch'
+    if any(p == '/spec/replicas' for p in paths):
+        return 'deployment_scaled_to_zero'
+    if any(str(p).startswith('/spec/template/spec/nodeSelector') for p in paths):
+        return 'deployment_node_selector_nonexistent_node'
+
+    low = ft.lower()
+    if 'target' in low and 'port' in low:
+        return 'service_target_port_mismatch'
+    if 'replica' in low or 'scale' in low:
+        return 'deployment_scaled_to_zero'
+    if 'selector' in low or 'node' in low:
+        return 'deployment_node_selector_nonexistent_node'
+    return ft or 'unknown'
+
+
+def get_resource(plan: dict[str, Any]) -> dict[str, Any]:
+    action = first_action(plan)
+    res = action.get('resource') or plan.get('root_cause') or {}
+    return res if isinstance(res, dict) else {}
+
+
+def set_action(plan: dict[str, Any], action: dict[str, Any]) -> dict[str, Any]:
+    p = copy.deepcopy(plan)
+    p['actions'] = [action]
+    return p
+
+
+def make_action(plan: dict[str, Any]) -> dict[str, Any]:
+    action = copy.deepcopy(first_action(plan))
+    if not action:
+        action = {
+            'tool': 'k8s_change',
+            'operation': 'json_patch',
+            'resource': get_resource(plan),
+            'patch': [],
+            'risk': 'low',
+        }
+    action.setdefault('tool', 'k8s_change')
+    action.setdefault('operation', 'json_patch')
+    action.setdefault('resource', get_resource(plan))
+    action.setdefault('risk', 'low')
+    action.setdefault('patch', [])
+    return action
+
+
+def expected_fix_for_fault(fault: str) -> tuple[str, Any, str]:
+    if fault == 'service_target_port_mismatch':
+        return '/spec/ports/0/targetPort', 9090, 'Service'
+    if fault == 'deployment_scaled_to_zero':
+        return '/spec/replicas', 1, 'Deployment'
+    if fault == 'deployment_node_selector_nonexistent_node':
+        return '/spec/template/spec/nodeSelector', None, 'Deployment'
+    return '', None, ''
+
+
+def wrong_value_for(path: str, value: Any) -> Any:
+    if path.endswith('/targetPort'):
+        return 8080 if value != 8080 else 9999
+    if path == '/spec/replicas':
+        return 0 if value != 0 else 2
+    if path.startswith('/spec/template/spec/nodeSelector'):
+        return {'kubernetes.io/hostname': 'extra-node'}
+    if isinstance(value, int):
+        return value + 1
+    if isinstance(value, str):
+        return value + '-wrong'
+    return 'wrong-value'
+
+
+def remove_test_ops(action: dict[str, Any]) -> dict[str, Any]:
+    a = copy.deepcopy(action)
+    a['patch'] = [p for p in patch_ops(a) if p.get('op') != 'test']
+    a['preconditions'] = []
+    return a
+
+
+def make_wrong_value_action(action: dict[str, Any], fault: str) -> dict[str, Any]:
+    a = copy.deepcopy(action)
+    new_patch = []
+    changed = False
+    for p in patch_ops(a):
+        q = copy.deepcopy(p)
+        if q.get('op') in {'replace', 'add'} and not changed:
+            q['value'] = wrong_value_for(q.get('path', ''), q.get('value'))
+            changed = True
+        elif q.get('op') == 'remove' and not changed:
+            # For nodeSelector, wrong repair keeps or rewrites the bad selector instead of removing it.
+            q = {
+                'op': 'replace',
+                'path': '/spec/template/spec/nodeSelector',
+                'value': {'kubernetes.io/hostname': 'extra-node'},
+            }
+            changed = True
+        new_patch.append(q)
+    if not changed:
+        path, _, _ = expected_fix_for_fault(fault)
+        new_patch.append({'op': 'replace', 'path': path, 'value': wrong_value_for(path, None)})
+    a['patch'] = new_patch
+    return a
+
+
+def make_wrong_resource_action(action: dict[str, Any], fault: str) -> dict[str, Any]:
+    a = copy.deepcopy(action)
+    res = copy.deepcopy(a.get('resource') or {})
+    if fault == 'service_target_port_mismatch':
+        res['kind'] = 'Deployment'
+    else:
+        res['kind'] = 'Service'
+    a['resource'] = res
+    return a
+
+
+def make_rollout_restart_action(plan: dict[str, Any]) -> dict[str, Any]:
+    res = copy.deepcopy(get_resource(plan))
+    if not res:
+        res = {'kind': 'Deployment', 'namespace': 'test-social-network', 'name': 'user-service'}
+    res['kind'] = 'Deployment'
+    return {
+        'tool': 'k8s_change',
+        'operation': 'json_patch',
+        'resource': res,
+        'patch': [
+            {'op': 'add', 'path': '/spec/template/metadata/annotations/safeops.io~1restartedAt', 'value': '2026-06-21T00:00:00Z'}
+        ],
+        'risk': 'low',
+        'reason': 'Rollout restart decoy; may restart pods but does not address the root-cause field.',
+        'preconditions': [],
+        'postconditions': [],
+        'rollback': 'resource_snapshot',
+    }
+
+
+def make_merge_patch_action(action: dict[str, Any], fault: str) -> dict[str, Any]:
+    a = copy.deepcopy(action)
+    a['operation'] = 'merge_patch'
+    path, value, _ = expected_fix_for_fault(fault)
+    if fault == 'service_target_port_mismatch':
+        a['patch'] = {'spec': {'ports': [{'targetPort': value}]}}
+    elif fault == 'deployment_scaled_to_zero':
+        a['patch'] = {'spec': {'replicas': value}}
+    else:
+        a['patch'] = {'spec': {'template': {'spec': {'nodeSelector': None}}}}
+    return a
+
+
+def make_delete_action(plan: dict[str, Any]) -> dict[str, Any]:
+    res = copy.deepcopy(get_resource(plan))
+    if not res:
+        res = {'kind': 'Service', 'namespace': 'test-social-network', 'name': 'user-service'}
+    return {
+        'tool': 'k8s_change',
+        'operation': 'delete',
+        'resource': res,
+        'patch': [],
+        'risk': 'high',
+        'reason': 'Dangerous delete decoy.',
+        'preconditions': [],
+        'postconditions': [],
+        'rollback': None,
+    }
+
+
+def generate_candidates(plan: dict[str, Any]) -> list[dict[str, Any]]:
+    fault = canonical_fault_type(plan)
+    base_action = make_action(plan)
+
+    candidates = []
+
+    candidates.append({
+        'candidate_id': 'chosen_json_patch',
+        'plan': set_action(plan, base_action),
+        'reward': 1.0,
+        'correct': True,
+        'description': 'verified/canonical JSON Patch plan',
+    })
+
+    candidates.append({
+        'candidate_id': 'missing_test_precondition',
+        'plan': set_action(plan, remove_test_ops(base_action)),
+        'reward': 0.45,
+        'correct': False,
+        'description': 'same repair but missing JSON Patch test/precondition',
+    })
+
+    candidates.append({
+        'candidate_id': 'wrong_patch_value',
+        'plan': set_action(plan, make_wrong_value_action(base_action, fault)),
+        'reward': -0.80,
+        'correct': False,
+        'description': 'wrong patch value or wrong nodeSelector mutation',
+    })
+
+    candidates.append({
+        'candidate_id': 'wrong_resource_kind',
+        'plan': set_action(plan, make_wrong_resource_action(base_action, fault)),
+        'reward': -0.60,
+        'correct': False,
+        'description': 'patches wrong Kubernetes resource kind',
+    })
+
+    candidates.append({
+        'candidate_id': 'rollout_restart_decoy',
+        'plan': set_action(plan, make_rollout_restart_action(plan)),
+        'reward': 0.00,
+        'correct': False,
+        'description': 'restart-like action that does not fix root-cause field',
+    })
+
+    candidates.append({
+        'candidate_id': 'merge_patch_decoy',
+        'plan': set_action(plan, make_merge_patch_action(base_action, fault)),
+        'reward': -0.25,
+        'correct': False,
+        'description': 'less auditable merge patch decoy',
+    })
+
+    candidates.append({
+        'candidate_id': 'rejected_delete_resource',
+        'plan': set_action(plan, make_delete_action(plan)),
+        'reward': -1.00,
+        'correct': False,
+        'description': 'dangerous delete candidate blocked by policy',
+    })
+
+    return candidates
+
+
+def is_blocked_by_policy(candidate: dict[str, Any]) -> bool:
+    plan = candidate['plan']
+    action = first_action(plan)
+    operation = action.get('operation')
+    risk = action.get('risk')
+    if operation in BLOCKED_OPERATIONS:
+        return True
+    if risk == 'high':
+        return True
+    return False
+
+
+def paths_from_action(action: dict[str, Any]) -> list[str]:
+    patch = action.get('patch')
+    if isinstance(patch, list):
+        return [str(p.get('path')) for p in patch if isinstance(p, dict) and p.get('path')]
+    return []
+
+
+def values_from_action(action: dict[str, Any]) -> list[Any]:
+    patch = action.get('patch')
+    if isinstance(patch, list):
+        return [p.get('value') for p in patch if isinstance(p, dict) and 'value' in p]
+    return []
+
+
+def feature_vector(plan: dict[str, Any], fault: str) -> np.ndarray:
+    action = first_action(plan)
+    res = action.get('resource') or {}
+    kind = str(res.get('kind') or '')
+    operation = str(action.get('operation') or 'other')
+    risk = action.get('risk')
+    patch = action.get('patch')
+    patch_list = patch if isinstance(patch, list) else []
+    paths = paths_from_action(action)
+    values = values_from_action(action)
+    ops = [p.get('op') for p in patch_list if isinstance(p, dict)]
+
+    path_targetport = any(p.endswith('/targetPort') for p in paths)
+    path_replicas = any(p == '/spec/replicas' for p in paths)
+    path_node_selector = any(p.startswith('/spec/template/spec/nodeSelector') for p in paths)
+    path_unknown = bool(paths) and not (path_targetport or path_replicas or path_node_selector)
+
+    kind_service = kind == 'Service'
+    kind_deploy = kind == 'Deployment'
+
+    has_test = 'test' in ops
+    has_replace = 'replace' in ops
+    has_remove = 'remove' in ops
+    has_add = 'add' in ops
+    has_mutation = any(o in {'replace', 'remove', 'add'} for o in ops)
+
+    v = {
+        'bias': 1.0,
+        'risk_low': 1.0 if risk == 'low' else 0.0,
+        'risk_medium': 1.0 if risk == 'medium' or risk is None else 0.0,
+        'risk_high': 1.0 if risk == 'high' else 0.0,
+        'op_json_patch': 1.0 if operation == 'json_patch' else 0.0,
+        'op_merge_patch': 1.0 if operation == 'merge_patch' else 0.0,
+        'op_delete': 1.0 if operation == 'delete' else 0.0,
+        'op_other': 1.0 if operation not in {'json_patch', 'merge_patch', 'delete'} else 0.0,
+        'kind_service': 1.0 if kind_service else 0.0,
+        'kind_deployment': 1.0 if kind_deploy else 0.0,
+        'kind_other': 1.0 if kind and not (kind_service or kind_deploy) else 0.0,
+        'fault_targetport': 1.0 if fault == 'service_target_port_mismatch' else 0.0,
+        'fault_scale': 1.0 if fault == 'deployment_scaled_to_zero' else 0.0,
+        'fault_assign': 1.0 if fault == 'deployment_node_selector_nonexistent_node' else 0.0,
+        'has_test': 1.0 if has_test else 0.0,
+        'has_replace': 1.0 if has_replace else 0.0,
+        'has_remove': 1.0 if has_remove else 0.0,
+        'has_add': 1.0 if has_add else 0.0,
+        'has_mutation': 1.0 if has_mutation else 0.0,
+        'patch_len_norm': min(len(patch_list), 5) / 5.0,
+        'path_targetport': 1.0 if path_targetport else 0.0,
+        'path_replicas': 1.0 if path_replicas else 0.0,
+        'path_node_selector': 1.0 if path_node_selector else 0.0,
+        'path_unknown': 1.0 if path_unknown else 0.0,
+        'align_targetport_path': 1.0 if fault == 'service_target_port_mismatch' and path_targetport else 0.0,
+        'align_scale_path': 1.0 if fault == 'deployment_scaled_to_zero' and path_replicas else 0.0,
+        'align_assign_path': 1.0 if fault == 'deployment_node_selector_nonexistent_node' and path_node_selector else 0.0,
+        'align_targetport_kind': 1.0 if fault == 'service_target_port_mismatch' and kind_service else 0.0,
+        'align_deployment_kind': 1.0 if fault in {'deployment_scaled_to_zero', 'deployment_node_selector_nonexistent_node'} and kind_deploy else 0.0,
+        'value_targetport_9090': 1.0 if 9090 in values else 0.0,
+        'value_replicas_1': 1.0 if 1 in values else 0.0,
+        'value_remove_node_selector': 1.0 if fault == 'deployment_node_selector_nonexistent_node' and has_remove and path_node_selector else 0.0,
+        'has_preconditions': 1.0 if action.get('preconditions') else 0.0,
+        'has_postconditions': 1.0 if action.get('postconditions') else 0.0,
+        'has_rollback': 1.0 if action.get('rollback') else 0.0,
+        'unsafe_like': 1.0 if operation in BLOCKED_OPERATIONS or risk == 'high' else 0.0,
+        'path_count_norm': min(len(paths), 5) / 5.0,
+    }
+    return np.array([v[name] for name in FEATURE_NAMES], dtype=float)
+
+
+def candidate_records(rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    episodes = []
+    skipped = 0
+    by_family = Counter()
+
+    for idx, row in enumerate(rows):
+        plan = extract_plan(row)
+        if not isinstance(plan, dict):
+            skipped += 1
+            continue
+        fault = canonical_fault_type(plan)
+        if fault not in CANONICAL_FAULTS:
+            skipped += 1
+            continue
+        plan = copy.deepcopy(plan)
+        plan['fault_type'] = fault
+        cands = generate_candidates(plan)
+        records = []
+        for c in cands:
+            blocked = is_blocked_by_policy(c)
+            x = feature_vector(c['plan'], fault)
+            records.append({
+                'candidate_id': c['candidate_id'],
+                'reward': float(c['reward']),
+                'correct': bool(c['correct']),
+                'blocked': bool(blocked),
+                'x': x,
+            })
+        ep_id = plan.get('task_id') or row.get('id') or row.get('episode_id') or f'pair_{idx:05d}'
+        episodes.append({'episode_id': ep_id, 'fault_family': fault, 'candidates': records})
+        by_family[fault] += 1
+
+    meta = {
+        'input_rows': len(rows),
+        'episodes': len(episodes),
+        'skipped': skipped,
+        'by_family': dict(by_family),
+        'features': FEATURE_NAMES,
+    }
+    return episodes, meta
+
+
+def pick_random_safe(candidates: list[dict[str, Any]], rng: random.Random) -> dict[str, Any]:
+    safe = [c for c in candidates if not c['blocked']]
+    return rng.choice(safe)
+
+
+def pick_min_risk(candidates: list[dict[str, Any]]) -> dict[str, Any]:
+    safe = [c for c in candidates if not c['blocked']]
+    def score(c: dict[str, Any]) -> tuple:
+        # Uses available plan-derived features, not the true reward.
+        x = c['x']
+        fmap = dict(zip(FEATURE_NAMES, x))
+        return (
+            -fmap['risk_low'],
+            -fmap['op_json_patch'],
+            -fmap['has_test'],
+            -fmap['has_mutation'],
+            fmap['path_unknown'],
+        )
+    return sorted(safe, key=score)[0]
+
+
+def evaluate_fixed_policy(episodes: list[dict[str, Any]], policy: str, seed: int) -> dict[str, Any]:
+    rng = random.Random(seed)
+    total_reward = 0.0
+    correct = 0
+    unsafe = 0
+    by_family = defaultdict(lambda: {'n': 0, 'reward': 0.0, 'correct': 0, 'unsafe': 0})
+
+    for ep in episodes:
+        if policy == 'random_safe':
+            chosen = pick_random_safe(ep['candidates'], rng)
+        elif policy == 'min_risk':
+            chosen = pick_min_risk(ep['candidates'])
+        else:
+            raise ValueError(policy)
+        total_reward += chosen['reward']
+        correct += int(chosen['correct'])
+        unsafe += int(chosen['blocked'])
+        fam = ep['fault_family']
+        by_family[fam]['n'] += 1
+        by_family[fam]['reward'] += chosen['reward']
+        by_family[fam]['correct'] += int(chosen['correct'])
+        by_family[fam]['unsafe'] += int(chosen['blocked'])
+
+    n = len(episodes)
+    return {
+        'avg_reward': total_reward / n if n else 0.0,
+        'selected_correct_rate': correct / n if n else 0.0,
+        'unsafe_selected_rate': unsafe / n if n else 0.0,
+        'by_family': {
+            fam: {
+                'n': v['n'],
+                'avg_reward': v['reward'] / v['n'] if v['n'] else 0.0,
+                'selected_correct_rate': v['correct'] / v['n'] if v['n'] else 0.0,
+                'unsafe_selected_rate': v['unsafe'] / v['n'] if v['n'] else 0.0,
+            }
+            for fam, v in sorted(by_family.items())
+        },
+    }
+
+
+def evaluate_linucb(episodes: list[dict[str, Any]], alpha: float, seed: int, lambda_reg: float = 1.0) -> dict[str, Any]:
+    rng = random.Random(seed)
+    eps = episodes[:]
+    rng.shuffle(eps)
+
+    d = len(FEATURE_NAMES)
+    A = lambda_reg * np.eye(d)
+    b = np.zeros(d)
+
+    total_reward = 0.0
+    correct = 0
+    unsafe = 0
+    chosen_ranks = []
+    first_wrong = []
+    by_family = defaultdict(lambda: {'n': 0, 'reward': 0.0, 'correct': 0, 'unsafe': 0})
+    selected_counts = Counter()
+
+    for t, ep in enumerate(eps):
+        safe = [c for c in ep['candidates'] if not c['blocked']]
+        A_inv = np.linalg.inv(A)
+        theta = A_inv @ b
+        scored = []
+        for c in safe:
+            x = c['x']
+            mean = float(theta @ x)
+            bonus = float(alpha * math.sqrt(max(0.0, x @ A_inv @ x)))
+            score = mean + bonus
+            scored.append((score, c))
+        scored.sort(key=lambda z: z[0], reverse=True)
+        chosen = scored[0][1]
+
+        # Rank of correct/canonical candidate under current score.
+        rank = None
+        for i, (_, c) in enumerate(scored, 1):
+            if c['correct']:
+                rank = i
+                break
+        if rank is not None:
+            chosen_ranks.append(rank)
+
+        r = chosen['reward']
+        x = chosen['x']
+        A += np.outer(x, x)
+        b += r * x
+
+        total_reward += r
+        correct += int(chosen['correct'])
+        unsafe += int(chosen['blocked'])
+        selected_counts[chosen['candidate_id']] += 1
+        fam = ep['fault_family']
+        by_family[fam]['n'] += 1
+        by_family[fam]['reward'] += r
+        by_family[fam]['correct'] += int(chosen['correct'])
+        by_family[fam]['unsafe'] += int(chosen['blocked'])
+
+        if not chosen['correct'] and len(first_wrong) < 20:
+            first_wrong.append({
+                't': t,
+                'episode_id': ep['episode_id'],
+                'fault_family': fam,
+                'selected': chosen['candidate_id'],
+                'reward': r,
+                'correct_rank': rank,
+            })
+
+    n = len(eps)
+    return {
+        'alpha': alpha,
+        'seed': seed,
+        'avg_reward': total_reward / n if n else 0.0,
+        'selected_correct_rate': correct / n if n else 0.0,
+        'unsafe_selected_rate': unsafe / n if n else 0.0,
+        'avg_chosen_rank': statistics.mean(chosen_ranks) if chosen_ranks else None,
+        'selected_counts': dict(selected_counts),
+        'first_wrong': first_wrong,
+        'by_family': {
+            fam: {
+                'n': v['n'],
+                'avg_reward': v['reward'] / v['n'] if v['n'] else 0.0,
+                'selected_correct_rate': v['correct'] / v['n'] if v['n'] else 0.0,
+                'unsafe_selected_rate': v['unsafe'] / v['n'] if v['n'] else 0.0,
+            }
+            for fam, v in sorted(by_family.items())
+        },
+    }
+
+
+def aggregate(results: list[dict[str, Any]]) -> dict[str, Any]:
+    def stat(key: str) -> dict[str, Any]:
+        vals = []
+        for r in results:
+            v = r.get(key, None)
+            if v is None:
+                continue
+            vals.append(float(v))
+        if not vals:
+            return {
+                'mean': None,
+                'std': None,
+                'min': None,
+                'max': None,
+            }
+        return {
+            'mean': statistics.mean(vals),
+            'std': statistics.pstdev(vals) if len(vals) > 1 else 0.0,
+            'min': min(vals),
+            'max': max(vals),
+        }
+    return {
+        'runs': len(results),
+        'avg_reward': stat('avg_reward'),
+        'selected_correct_rate': stat('selected_correct_rate'),
+        'unsafe_selected_rate': stat('unsafe_selected_rate'),
+        'avg_chosen_rank': stat('avg_chosen_rank'),
+    }
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description='Multi-fault LinUCB offline replay over synthesized safe/unsafe candidate plans.')
+    parser.add_argument('--preference-pairs', default='planner/data_multifault/preference_pairs.jsonl')
+    parser.add_argument('--out-dir', default='../artifacts/bandit_results')
+    parser.add_argument('--alphas', default='0.0,0.1,0.3,0.6,1.0')
+    parser.add_argument('--seeds', default='0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19')
+    parser.add_argument('--max-rows', type=int, default=None)
+    parser.add_argument('--stamp', default=None)
+    args = parser.parse_args()
+
+    in_path = Path(args.preference_pairs)
+    rows = read_jsonl(in_path)
+    if args.max_rows is not None:
+        rows = rows[:args.max_rows]
+    episodes, meta = candidate_records(rows)
+
+    if not episodes:
+        raise SystemExit(f'No usable episodes extracted from {in_path}. Check preference pair schema.')
+
+    total_candidates = sum(len(ep['candidates']) for ep in episodes)
+    blocked = sum(int(c['blocked']) for ep in episodes for c in ep['candidates'])
+    meta.update({
+        'preference_pairs_path': str(in_path),
+        'candidate_count': total_candidates,
+        'blocked_by_policy': blocked,
+        'safe_candidate_count': total_candidates - blocked,
+        'candidates_per_episode': total_candidates / len(episodes),
+    })
+
+    seeds = [int(x) for x in args.seeds.split(',') if x.strip()]
+    alphas = [float(x) for x in args.alphas.split(',') if x.strip()]
+
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stamp = args.stamp or __import__('datetime').datetime.now().strftime('%Y-%m-%d_%H%M%S')
+
+    # Baselines over all seeds for random, single deterministic for min_risk but repeated for consistent schema.
+    baseline_runs = {'random_safe': [], 'min_risk': []}
+    for seed in seeds:
+        baseline_runs['random_safe'].append(evaluate_fixed_policy(episodes, 'random_safe', seed))
+        baseline_runs['min_risk'].append(evaluate_fixed_policy(episodes, 'min_risk', seed))
+
+    linucb_runs_by_alpha: dict[str, list[dict[str, Any]]] = {}
+    per_seed_rows = []
+    for alpha in alphas:
+        key = str(alpha)
+        linucb_runs_by_alpha[key] = []
+        for seed in seeds:
+            r = evaluate_linucb(episodes, alpha=alpha, seed=seed)
+            linucb_runs_by_alpha[key].append(r)
+            per_seed_rows.append({
+                'method': 'linucb',
+                'alpha': alpha,
+                'seed': seed,
+                'avg_reward': r['avg_reward'],
+                'selected_correct_rate': r['selected_correct_rate'],
+                'unsafe_selected_rate': r['unsafe_selected_rate'],
+                'avg_chosen_rank': r['avg_chosen_rank'],
+            })
+
+    methods_summary = {
+        'random_safe': aggregate(baseline_runs['random_safe']),
+        'min_risk': aggregate(baseline_runs['min_risk']),
+        'linucb_by_alpha': {alpha: aggregate(runs) for alpha, runs in linucb_runs_by_alpha.items()},
+    }
+
+    # Best alpha by mean selected_correct_rate, tie by avg_reward.
+    best_alpha = max(
+        methods_summary['linucb_by_alpha'].items(),
+        key=lambda kv: (kv[1]['selected_correct_rate']['mean'], kv[1]['avg_reward']['mean'])
+    )[0]
+    best_runs = linucb_runs_by_alpha[best_alpha]
+
+    # Aggregate by-family for best alpha.
+    fam_agg = defaultdict(lambda: defaultdict(list))
+    for r in best_runs:
+        for fam, vals in r['by_family'].items():
+            for k in ['avg_reward', 'selected_correct_rate', 'unsafe_selected_rate']:
+                fam_agg[fam][k].append(vals[k])
+    best_by_family = {
+        fam: {k: {'mean': statistics.mean(v), 'std': statistics.pstdev(v) if len(v) > 1 else 0.0} for k, v in metrics.items()}
+        for fam, metrics in sorted(fam_agg.items())
+    }
+
+    candidate_selection_counts = Counter()
+    for r in best_runs:
+        candidate_selection_counts.update(r.get('selected_counts', {}))
+
+    summary = {
+        'meta': meta,
+        'seeds': seeds,
+        'alphas': alphas,
+        'methods': methods_summary,
+        'best_alpha': float(best_alpha),
+        'best_alpha_by_family': best_by_family,
+        'best_alpha_selected_counts_total': dict(candidate_selection_counts),
+        'example_first_wrong_best_alpha_seed0': (best_runs[0].get('first_wrong') if best_runs else []),
+        'notes': [
+            'This is offline replay over generated multi-fault candidate plans, not an online bandit update inside live AIOpsLab.',
+            'Policy blocks destructive/high-risk candidates such as delete; remaining candidates test ranking among safe or non-destructive alternatives.',
+            'Rewards are shaped labels for candidate quality; live Oracle reward integration is the next stage.'
+        ],
+    }
+
+    summary_path = out_dir / f'multifault_linucb_replay_summary_{stamp}.json'
+    csv_path = out_dir / f'multifault_linucb_replay_per_seed_{stamp}.csv'
+    summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+
+    with csv_path.open('w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=['method', 'alpha', 'seed', 'avg_reward', 'selected_correct_rate', 'unsafe_selected_rate', 'avg_chosen_rank'])
+        writer.writeheader()
+        for row in per_seed_rows:
+            writer.writerow(row)
+
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
+    print(f'[saved] {summary_path}')
+    print(f'[saved] {csv_path}')
+
+
+if __name__ == '__main__':
+    main()
